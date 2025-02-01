@@ -14,7 +14,8 @@ wgpu = { version = "24.0", features = ["serde"] }
 winit = { version = "0.30", features = ["serde"] }
 pollster = "0.4"
 
-egui = "0.30"
+egui = { version = "0.30", features = ["bytemuck"] }
+bytemuck = "1.21"
 
 # The biggest fucking library known to man
 serde = { version = "1.0", features = ["derive"] }
