@@ -15,20 +15,20 @@ use serde::{
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct Root {
-    main:   Main,
-    render: Render,
+    pub main:   Main,
+    pub render: Render,
 }
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct Main {
     #[serde(default)]
-    log_directory: Option<PathBuf>,
+    pub log_directory: Option<PathBuf>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct Render {
     #[serde(default)]
-    preferred_gpu: wgpu::PowerPreference,
+    pub preferred_gpu: wgpu::PowerPreference,
 }
 
 pub static PROJECT_DIRS: LazyLock<directories::ProjectDirs> = LazyLock::new(|| {

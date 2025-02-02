@@ -10,12 +10,17 @@ authors = [
 tracing = "0.1"
 tracing-subscriber = "0.3"
 
-wgpu = { version = "24.0", features = ["serde"] }
-winit = { version = "0.30", features = ["serde"] }
-pollster = "0.4"
-
 egui = { version = "0.30", features = ["bytemuck"] }
+eframe = { version = "0.30", default_features = false, features = [
+    "default_fonts",
+    "wgpu",
+    "wayland",
+    "x11",
+] }
 bytemuck = "1.21"
+image = "0.25"
+
+wgpu = { version = "*", features = ["webgpu", "serde"] }
 
 # The biggest fucking library known to man
 serde = { version = "1.0", features = ["derive"] }
