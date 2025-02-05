@@ -1,6 +1,13 @@
-use std::sync::{
-    Arc,
-    RwLock,
+#![allow(clippy::needless_pass_by_value)]
+use std::{
+    marker::PhantomPinned,
+    pin::Pin,
+    ptr::NonNull,
+    sync::{
+        Arc,
+        RwLock,
+    },
+    time::Instant,
 };
 
 use bevy::{
@@ -13,16 +20,34 @@ use bevy::{
         BLUE,
         RED,
     },
-    prelude::*,
+    input::mouse::MouseMotion,
+    prelude::{
+        Transform,
+        *,
+    },
     render::mesh::MeshVertexAttribute,
+    window::{
+        CursorGrabMode,
+        PrimaryWindow,
+    },
 };
 use bevy_egui::{
     egui,
     EguiContexts,
+    EguiInputSet,
     EguiPlugin,
+    EguiPostUpdateSet,
+    EguiPreUpdateSet,
 };
-use step::step_file::StepFile;
+use bevy_panorbit_camera::{
+    PanOrbitCamera,
+    PanOrbitCameraPlugin,
+};
+use rayon::prelude::*;
 use tracing::info;
+use truck_meshalgo::prelude::*;
+use truck_modeling::TOLERANCE;
+use truck_stepio::r#in::ruststep;
 
 mod config;
 
@@ -30,6 +55,8 @@ mod config;
 enum StepAssetLoaderError {
     #[error("Io Error")]
     IoError(#[from] std::io::Error),
+    #[error("Step Parse Error")]
+    StepError(#[from] ruststep::error::Error),
 }
 
 #[derive(Default)]
@@ -44,49 +71,59 @@ impl AssetLoader for StepAssetLoader {
         &self,
         reader: &mut dyn bevy::asset::io::Reader,
         _settings: &Self::Settings,
-        _load_context: &mut bevy::asset::LoadContext<'_>,
+        load_context: &mut bevy::asset::LoadContext<'_>,
     ) -> Result<Self::Asset, Self::Error> {
-        let mut buffer = Vec::new();
-        reader.read_to_end(&mut buffer).await?;
+        info!(path = ?load_context.path(), "Processing StepFile");
+        let start = Instant::now();
 
-        let buffer = StepFile::strip_flatten(&buffer);
-        let parsed = StepFile::parse(&buffer);
+        let mut buffer = String::new();
+        reader.read_to_string(&mut buffer).await?;
 
-        let (mesh, _stats) = triangulate::triangulate::triangulate(&parsed);
-        Ok(Mesh::new(
+        let exchange = ruststep::parser::parse(&buffer)?;
+        let table = truck_stepio::r#in::Table::from_data_section(&exchange.data[0]);
+        let mesh = table
+            .shell
+            .par_iter()
+            .map(|(_idx, shell)| {
+                let shell = table.to_compressed_shell(shell).expect("shitface");
+                let poly = shell.robust_triangulation(0.01).to_polygon().bounding_box();
+                let mut poly = shell
+                    .robust_triangulation(poly.diameter() * 0.001)
+                    .to_polygon();
+                poly.remove_degenerate_faces();
+                poly
+            })
+            .reduce(PolygonMesh::default, |mut acc, e| {
+                acc.merge(e);
+                acc
+            })
+            .expands(|attribs| {
+                let pos = attribs.position.cast::<f32>().expect("shitface");
+                let normal = attribs
+                    .normal
+                    .expect("shitface")
+                    .cast::<f32>()
+                    .expect("shitface");
+                ([pos.x, pos.y, pos.z], [normal.x, normal.y, normal.z])
+            });
+        let indices = mesh
+            .faces()
+            .triangle_iter()
+            .flatten()
+            .map(|x| u32::try_from(x).expect("shitface"))
+            .collect::<Vec<_>>();
+        let (vertices, normals): (Vec<_>, Vec<_>) = mesh.attributes().iter().copied().unzip();
+
+        info!(elapsed = ?start.elapsed(), tris = indices.len() / 3,  "Finished processing");
+        let mesh = Mesh::new(
             bevy::render::mesh::PrimitiveTopology::TriangleList,
             RenderAssetUsages::RENDER_WORLD,
         )
-        .with_inserted_attribute(
-            Mesh::ATTRIBUTE_POSITION,
-            mesh.verts
-                .iter()
-                .map(|vertex| vertex.pos.data.0[0].map(|v| v as f32))
-                .collect::<Vec<_>>(),
-        )
-        .with_inserted_attribute(
-            Mesh::ATTRIBUTE_NORMAL,
-            mesh.verts
-                .iter()
-                .map(|vertex| vertex.norm.data.0[0].map(|v| v as f32))
-                .collect::<Vec<_>>(),
-        )
-        .with_inserted_attribute(
-            Mesh::ATTRIBUTE_COLOR,
-            mesh.verts
-                .iter()
-                .map(|vertex| {
-                    let arr = vertex.color.data.0[0].map(|v| v as f32);
-                    [arr[0], arr[1], arr[2], 1.0]
-                })
-                .collect::<Vec<_>>(),
-        )
-        .with_inserted_indices(bevy::render::mesh::Indices::U32(
-            mesh.triangles
-                .iter()
-                .flat_map(|tri| tri.verts.iter().copied())
-                .collect::<Vec<_>>(),
-        )))
+        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, vertices)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+        .with_inserted_indices(bevy::render::mesh::Indices::U32(indices));
+
+        Ok(mesh)
     }
 
     fn extensions(&self) -> &[&str] {
@@ -104,13 +141,14 @@ fn main() {
             }),
             ..Default::default()
         }))
-        .add_plugins(EguiPlugin)
+        .add_plugins((EguiPlugin, PanOrbitCameraPlugin))
         .register_asset_loader(StepAssetLoader)
         // Systems that create Egui widgets should be run during the `Update` Bevy schedule,
         // or after the `EguiPreUpdateSet::BeginPass` system (which belongs to the `PreUpdate` Bevy
         // schedule).
         .add_systems(Startup, setup)
         .add_systems(Update, ui_example_system)
+        //.add_systems(FixedUpdate, camera_movement)
         .run();
 }
 
@@ -118,20 +156,23 @@ fn setup(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut ambient_light: ResMut<AmbientLight>,
 ) {
-    let mesh: Handle<Mesh> = asset_server.load("test.step");
+    let step: Handle<Mesh> = asset_server.load("/home/gls/source/Rust/Laplace/assets/test.step");
     commands.spawn((
-        Mesh3d(mesh),
+        Mesh3d(step),
         MeshMaterial3d(materials.add(StandardMaterial {
             base_color: BLUE.into(),
             ..Default::default()
         })),
-        Transform::from_scale(Vec3::splat(0.1)),
+        Transform::from_scale(Vec3::splat(1.0)),
     ));
 
+    ambient_light.brightness = 500.0;
+
     commands.spawn((
-        Camera3d::default(),
-        Transform::from_xyz(0.0, 7., 14.0).looking_at(Vec3::new(0., 1., 0.), Vec3::Y),
+        PanOrbitCamera::default(),
+        Transform::from_xyz(0.0, 1., 1.0).looking_at(Vec3::new(0., 0., 0.), Vec3::Y),
     ));
 }
 

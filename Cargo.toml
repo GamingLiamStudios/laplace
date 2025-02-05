@@ -20,26 +20,37 @@ directories = "6.0"
 
 # ...But i think this is bigger
 bevy = { version = "0.15", default-features = false, features = [
-    "bevy_core_pipeline",
-    "bevy_color",
-    "bevy_render",
-    "bevy_pbr",
-    "bevy_mesh_picking_backend",
-    "bevy_state",
-    "bevy_asset",
-    "bevy_window",
-    "bevy_winit",
-    "bevy_scene",
-    "multi_threaded",
-    "x11",
     "wayland",
     "dynamic_linking",
     "file_watcher",
+    "bevy_gizmos",
+    "bevy_pbr",
+    "bevy_gltf",
+    "bevy_scene",
+    "bevy_asset",
+    "bevy_color",
+    "bevy_core_pipeline",
+    "bevy_picking",
+    "bevy_mesh_picking_backend",
+    "bevy_render",
+    "bevy_window",
+    "bevy_winit",
+    "multi_threaded",
+    "x11",
+    "bevy_state",
+    "animation",
+    "bevy_animation",
+    "tonemapping_luts",
 ] }
 bevy_egui = "0.32"
+bevy_panorbit_camera = { version = "0.22", features = ["bevy_egui"] }
 
-step = { git = "https://github.com/Formlabs/foxtrot.git" }
-triangulate = { git = "https://github.com/Formlabs/foxtrot.git" }
+truck-modeling = { git = "https://github.com/ricosjp/truck.git" }
+truck-meshalgo = { git = "https://github.com/ricosjp/truck.git", default-features = false, features = [
+    "tessellation",
+] }
+truck-stepio = { git = "https://github.com/ricosjp/truck.git" }
+rayon = "1.10"
 
 [profile.dev]
 opt-level = 1
