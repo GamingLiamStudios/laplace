@@ -1,6 +1,10 @@
 #![allow(clippy::needless_pass_by_value)]
 use std::{
     marker::PhantomPinned,
+    path::{
+        Path,
+        PathBuf,
+    },
     pin::Pin,
     ptr::NonNull,
     sync::{
@@ -12,32 +16,67 @@ use std::{
 
 use bevy::{
     asset::{
+        io::{
+            file::FileAssetReader,
+            memory::MemoryAssetReader,
+            AssetReader,
+            AssetSource,
+            PathStream,
+        },
         AssetLoader,
+        AssetPath,
         AsyncReadExt,
         RenderAssetUsages,
     },
     color::palettes::css::{
         BLUE,
+        DEEP_PINK,
+        GREEN,
+        LIME,
         RED,
+        WHITE,
     },
-    input::mouse::MouseMotion,
+    diagnostic::{
+        DiagnosticPath,
+        DiagnosticsStore,
+        FrameTimeDiagnosticsPlugin,
+        LogDiagnosticsPlugin,
+    },
+    ecs::world::CommandQueue,
+    pbr::wireframe::{
+        Wireframe,
+        WireframeColor,
+        WireframeConfig,
+        WireframePlugin,
+    },
     prelude::{
         Transform,
         *,
     },
-    render::mesh::MeshVertexAttribute,
-    window::{
-        CursorGrabMode,
-        PrimaryWindow,
+    render::{
+        settings::{
+            WgpuFeatures,
+            WgpuSettings,
+        },
+        RenderPlugin,
+    },
+    tasks::{
+        block_on,
+        futures_lite::{
+            future,
+            StreamExt,
+        },
+        AsyncComputeTaskPool,
+        Task,
     },
 };
 use bevy_egui::{
-    egui,
+    egui::{
+        self,
+        RichText,
+    },
     EguiContexts,
-    EguiInputSet,
     EguiPlugin,
-    EguiPostUpdateSet,
-    EguiPreUpdateSet,
 };
 use bevy_panorbit_camera::{
     PanOrbitCamera,
@@ -47,7 +86,10 @@ use rayon::prelude::*;
 use tracing::info;
 use truck_meshalgo::prelude::*;
 use truck_modeling::TOLERANCE;
-use truck_stepio::r#in::ruststep;
+use truck_stepio::r#in::{
+    ruststep,
+    Table,
+};
 
 mod config;
 
@@ -59,11 +101,17 @@ enum StepAssetLoaderError {
     StepError(#[from] ruststep::error::Error),
 }
 
+#[derive(Asset, TypePath)]
+struct StepAsset {
+    mesh:  Handle<Mesh>,
+    table: Table,
+}
+
 #[derive(Default)]
 struct StepAssetLoader;
 
 impl AssetLoader for StepAssetLoader {
-    type Asset = Mesh;
+    type Asset = StepAsset;
     type Error = StepAssetLoaderError;
     type Settings = ();
 
@@ -81,17 +129,16 @@ impl AssetLoader for StepAssetLoader {
 
         let exchange = ruststep::parser::parse(&buffer)?;
         let table = truck_stepio::r#in::Table::from_data_section(&exchange.data[0]);
+
         let mesh = table
             .shell
             .par_iter()
             .map(|(_idx, shell)| {
                 let shell = table.to_compressed_shell(shell).expect("shitface");
                 let poly = shell.robust_triangulation(0.01).to_polygon().bounding_box();
-                let mut poly = shell
+                shell
                     .robust_triangulation(poly.diameter() * 0.001)
-                    .to_polygon();
-                poly.remove_degenerate_faces();
-                poly
+                    .to_polygon()
             })
             .reduce(PolygonMesh::default, |mut acc, e| {
                 acc.merge(e);
@@ -123,13 +170,33 @@ impl AssetLoader for StepAssetLoader {
         .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
         .with_inserted_indices(bevy::render::mesh::Indices::U32(indices));
 
-        Ok(mesh)
+        let mesh = load_context.add_labeled_asset("StepAsset_Mesh".to_string(), mesh);
+        Ok(StepAsset { mesh, table })
     }
 
     fn extensions(&self) -> &[&str] {
         &["step"]
     }
 }
+
+#[derive(Component, Default)]
+struct LoadingMesh {
+    handle: Handle<StepAsset>,
+}
+
+#[derive(Resource)]
+struct SelectedMesh {
+    id:          Entity,
+    loaded_path: AssetPath<'static>,
+}
+
+#[derive(Resource)]
+struct FoundFiles {
+    paths: Vec<PathBuf>,
+}
+
+#[derive(Component)]
+struct ComputeTask(Task<CommandQueue>);
 
 fn main() {
     App::new()
@@ -141,13 +208,12 @@ fn main() {
             }),
             ..Default::default()
         }))
-        .add_plugins((EguiPlugin, PanOrbitCameraPlugin))
+        .add_plugins((EguiPlugin, PanOrbitCameraPlugin, FrameTimeDiagnosticsPlugin))
         .register_asset_loader(StepAssetLoader)
-        // Systems that create Egui widgets should be run during the `Update` Bevy schedule,
-        // or after the `EguiPreUpdateSet::BeginPass` system (which belongs to the `PreUpdate` Bevy
-        // schedule).
+        .init_asset::<StepAsset>()
         .add_systems(Startup, setup)
         .add_systems(Update, ui_example_system)
+        .add_systems(Update, (while_mesh_loading, while_compute_task))
         //.add_systems(FixedUpdate, camera_movement)
         .run();
 }
@@ -155,18 +221,40 @@ fn main() {
 fn setup(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
-    mut materials: ResMut<Assets<StandardMaterial>>,
     mut ambient_light: ResMut<AmbientLight>,
 ) {
-    let step: Handle<Mesh> = asset_server.load("/home/gls/source/Rust/Laplace/assets/test.step");
-    commands.spawn((
-        Mesh3d(step),
-        MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: BLUE.into(),
-            ..Default::default()
-        })),
-        Transform::from_scale(Vec3::splat(1.0)),
-    ));
+    let compute_pool = AsyncComputeTaskPool::get();
+
+    let step: Handle<StepAsset> = asset_server.load("test.step");
+    commands.spawn(LoadingMesh { handle: step });
+
+    let compute_entity = commands.spawn_empty().id();
+    let task = compute_pool.spawn(async move {
+        let paths = AssetSource::get_default_reader("assets".to_string())()
+            .read_directory(Path::new("."))
+            .await
+            .expect("shitface");
+        let mut paths_vec = Vec::new();
+        paths
+            .for_each(|path| {
+                let Some(ext) = path.extension().and_then(|ext| ext.to_str()) else {
+                    return;
+                };
+                if ext == "step" {
+                    paths_vec.push(path);
+                }
+            })
+            .await;
+
+        let mut queue = CommandQueue::default();
+        queue.push(move |world: &mut World| {
+            world.insert_resource(FoundFiles { paths: paths_vec });
+            world.despawn(compute_entity);
+        });
+
+        queue
+    });
+    commands.entity(compute_entity).insert(ComputeTask(task));
 
     ambient_light.brightness = 500.0;
 
@@ -176,11 +264,112 @@ fn setup(
     ));
 }
 
-fn ui_example_system(mut contexts: EguiContexts) {
+fn while_mesh_loading(
+    mut commands: Commands,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    loaded: Res<Assets<StepAsset>>,
+    loading: Query<(Entity, &LoadingMesh)>,
+) {
+    for (entity, loading) in loading.iter() {
+        let Some(loaded) = loaded.get(&loading.handle) else {
+            continue;
+        };
+        let path = loading.handle.path().expect("shitface");
+
+        info!("Asset Loaded");
+        let loaded = commands
+            .spawn((
+                Mesh3d(loaded.mesh.clone()),
+                MeshMaterial3d(materials.add(StandardMaterial {
+                    base_color: BLUE.into(),
+                    ..Default::default()
+                })),
+                Transform::from_scale(Vec3::splat(1.0)),
+            ))
+            .id();
+        commands.insert_resource(SelectedMesh {
+            id:          loaded,
+            loaded_path: path.clone(),
+        });
+
+        commands.entity(entity).despawn();
+    }
+}
+
+fn while_compute_task(
+    mut commands: Commands,
+    mut tasks: Query<&mut ComputeTask>,
+) {
+    for mut task in &mut tasks {
+        if let Some(mut queue) = block_on(future::poll_once(&mut task.0)) {
+            commands.append(&mut queue);
+        }
+    }
+}
+
+fn ui_example_system(
+    mut contexts: EguiContexts,
+    diagnostics: Res<DiagnosticsStore>,
+    available: Option<Res<FoundFiles>>,
+
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    loaded: Option<ResMut<SelectedMesh>>,
+) {
+    let fps = diagnostics
+        .get(&FrameTimeDiagnosticsPlugin::FPS)
+        .and_then(bevy::diagnostic::Diagnostic::smoothed)
+        .unwrap_or(0.0)
+        .round();
+    let frame_time = diagnostics
+        .get(&FrameTimeDiagnosticsPlugin::FRAME_TIME)
+        .and_then(bevy::diagnostic::Diagnostic::value)
+        .unwrap_or(0.0)
+        .round();
+
     egui::SidePanel::left("Left Panel").show(contexts.ctx_mut(), |ui| {
+        ui.heading("Debug info");
+        ui.label(format!("FPS: {fps}"));
+        ui.label(format!("Frame: {frame_time}"));
+
+        ui.separator();
         ui.heading("Hello World!");
         if ui.button("fuck me").clicked() {
             info!("harder");
+        }
+
+        let Some(paths) = available else {
+            return;
+        };
+
+        let original = loaded
+            .as_ref()
+            .map(|loaded| loaded.loaded_path.path().to_path_buf());
+        let mut sel = original.clone();
+        egui::ComboBox::new("uh", "woof")
+            .selected_text(
+                original
+                    .as_ref()
+                    .map_or("None".to_string(), |path| format!("{path:?}")),
+            )
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut sel, None, "None");
+                for path in &paths.paths {
+                    ui.selectable_value(&mut sel, Some(path.clone()), format!("{path:?}"));
+                }
+            });
+        if original != sel {
+            // Despawn old
+            if let Some(loaded) = loaded {
+                commands.entity(loaded.id).despawn();
+                commands.remove_resource::<SelectedMesh>();
+            }
+            // Spawn new
+            if let Some(sel) = sel {
+                commands.spawn(LoadingMesh {
+                    handle: asset_server.load(sel),
+                });
+            }
         }
     });
 
