@@ -1,6 +1,7 @@
 #![allow(clippy::needless_pass_by_value)]
 use std::{
     marker::PhantomPinned,
+    ops::Bound,
     path::{
         Path,
         PathBuf,
@@ -43,6 +44,7 @@ use bevy::{
         LogDiagnosticsPlugin,
     },
     ecs::world::CommandQueue,
+    gizmos,
     pbr::wireframe::{
         Wireframe,
         WireframeColor,
@@ -55,6 +57,7 @@ use bevy::{
     },
     render::{
         settings::{
+            Backends,
             WgpuFeatures,
             WgpuSettings,
         },
@@ -85,7 +88,11 @@ use bevy_panorbit_camera::{
 use rayon::prelude::*;
 use tracing::info;
 use truck_meshalgo::prelude::*;
-use truck_modeling::TOLERANCE;
+use truck_modeling::{
+    Line,
+    Transform as TruckTransform,
+    TOLERANCE,
+};
 use truck_stepio::r#in::{
     ruststep,
     Table,
@@ -103,8 +110,9 @@ enum StepAssetLoaderError {
 
 #[derive(Asset, TypePath)]
 struct StepAsset {
-    mesh:  Handle<Mesh>,
-    table: Table,
+    mesh:      Handle<Mesh>,
+    table:     Table,
+    polylines: Vec<PolylineCurve<Point3>>,
 }
 
 #[derive(Default)]
@@ -130,20 +138,22 @@ impl AssetLoader for StepAssetLoader {
         let exchange = ruststep::parser::parse(&buffer)?;
         let table = truck_stepio::r#in::Table::from_data_section(&exchange.data[0]);
 
+        let mut polylines = Vec::new();
         let mesh = table
             .shell
-            .par_iter()
-            .map(|(_idx, shell)| {
+            .values()
+            .map(|shell| {
                 let shell = table.to_compressed_shell(shell).expect("shitface");
-                let poly = shell.robust_triangulation(0.01).to_polygon().bounding_box();
-                shell
-                    .robust_triangulation(poly.diameter() * 0.001)
-                    .to_polygon()
+                let bounds = shell.robust_triangulation(0.01).to_polygon().bounding_box();
+                let poly = shell.robust_triangulation(bounds.diameter() * 0.001);
+                polylines.extend(poly.edges.iter().cloned().map(|edge| edge.curve));
+                poly.to_polygon()
             })
-            .reduce(PolygonMesh::default, |mut acc, e| {
+            .reduce(|mut acc, e| {
                 acc.merge(e);
                 acc
             })
+            .expect("shitface")
             .expands(|attribs| {
                 let pos = attribs.position.cast::<f32>().expect("shitface");
                 let normal = attribs
@@ -171,7 +181,11 @@ impl AssetLoader for StepAssetLoader {
         .with_inserted_indices(bevy::render::mesh::Indices::U32(indices));
 
         let mesh = load_context.add_labeled_asset("StepAsset_Mesh".to_string(), mesh);
-        Ok(StepAsset { mesh, table })
+        Ok(StepAsset {
+            mesh,
+            table,
+            polylines,
+        })
     }
 
     fn extensions(&self) -> &[&str] {
@@ -186,8 +200,8 @@ struct LoadingMesh {
 
 #[derive(Resource)]
 struct SelectedMesh {
-    id:          Entity,
-    loaded_path: AssetPath<'static>,
+    id:     Entity,
+    loaded: Handle<StepAsset>,
 }
 
 #[derive(Resource)]
@@ -212,7 +226,7 @@ fn main() {
         .register_asset_loader(StepAssetLoader)
         .init_asset::<StepAsset>()
         .add_systems(Startup, setup)
-        .add_systems(Update, ui_example_system)
+        .add_systems(Update, (ui_example_system, render_gizmos))
         .add_systems(Update, (while_mesh_loading, while_compute_task))
         //.add_systems(FixedUpdate, camera_movement)
         .run();
@@ -222,10 +236,12 @@ fn setup(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
     mut ambient_light: ResMut<AmbientLight>,
+
+    mut config_store: ResMut<GizmoConfigStore>,
 ) {
     let compute_pool = AsyncComputeTaskPool::get();
 
-    let step: Handle<StepAsset> = asset_server.load("test.step");
+    let step: Handle<StepAsset> = asset_server.load("test2.step");
     commands.spawn(LoadingMesh { handle: step });
 
     let compute_entity = commands.spawn_empty().id();
@@ -262,11 +278,72 @@ fn setup(
         PanOrbitCamera::default(),
         Transform::from_xyz(0.0, 1., 1.0).looking_at(Vec3::new(0., 0., 0.), Vec3::Y),
     ));
+
+    let (config, _) = config_store.config_mut::<DefaultGizmoConfigGroup>();
+    //config.line_width = 5.0;
+    //config.depth_bias = -1.0;
+}
+
+fn render_gizmos(
+    mut gizmos: Gizmos,
+    loaded: Res<Assets<StepAsset>>,
+) {
+    for (_, loaded) in loaded.iter() {
+        for PolylineCurve(points) in &loaded.polylines {
+            gizmos.linestrip(
+                points
+                    .iter()
+                    .map(|v| Vec3::new(v.x as f32, v.y as f32, v.z as f32)),
+                WHITE,
+            );
+        }
+
+        /*
+        for shell in loaded.table.shell.values() {
+            let shell = loaded.table.to_compressed_shell(shell).expect("shitface");
+            for edge in shell.edges {
+                match edge.curve {
+                    truck_stepio::r#in::step_geometry::Curve3D::Line(Line(start, end)) => {
+                        gizmos.line(
+                            Vec3::new(start.x as f32, start.y as f32, start.z as f32),
+                            Vec3::new(end.x as f32, end.y as f32, end.z as f32),
+                            WHITE,
+                        );
+                    },
+                    truck_stepio::r#in::step_geometry::Curve3D::Conic(conic) => {
+                        let (start, end) = conic.range_tuple();
+                        let interval = Interval::new(start as f32, end as f32).expect("shitface");
+                        const STEP: i32 = 200;
+                        gizmos.curve_3d(
+                            FunctionCurve::new(
+                                // Domain should *probably* be the parameter_range, but this works
+                                interval,
+                                |x| {
+                                    let point = conic.subs(x as f64);
+                                    Vec3::new(point.x as f32, point.y as f32, point.z as f32)
+                                },
+                            ),
+                            (0..STEP)
+                                .map(|i| {
+                                    start * ((STEP - i) as f64 / (STEP as f64))
+                                        + end * (i as f64 / (STEP as f64))
+                                })
+                                .map(|v| v as f32),
+                            WHITE,
+                        );
+                    },
+                    _ => (),
+                }
+            }
+        }
+        */
+    }
 }
 
 fn while_mesh_loading(
     mut commands: Commands,
     mut materials: ResMut<Assets<StandardMaterial>>,
+
     loaded: Res<Assets<StepAsset>>,
     loading: Query<(Entity, &LoadingMesh)>,
 ) {
@@ -274,10 +351,9 @@ fn while_mesh_loading(
         let Some(loaded) = loaded.get(&loading.handle) else {
             continue;
         };
-        let path = loading.handle.path().expect("shitface");
 
         info!("Asset Loaded");
-        let loaded = commands
+        let id = commands
             .spawn((
                 Mesh3d(loaded.mesh.clone()),
                 MeshMaterial3d(materials.add(StandardMaterial {
@@ -288,10 +364,9 @@ fn while_mesh_loading(
             ))
             .id();
         commands.insert_resource(SelectedMesh {
-            id:          loaded,
-            loaded_path: path.clone(),
+            id,
+            loaded: loading.handle.clone(),
         });
-
         commands.entity(entity).despawn();
     }
 }
@@ -330,7 +405,7 @@ fn ui_example_system(
     egui::SidePanel::left("Left Panel").show(contexts.ctx_mut(), |ui| {
         ui.heading("Debug info");
         ui.label(format!("FPS: {fps}"));
-        ui.label(format!("Frame: {frame_time}"));
+        ui.label(format!("Frame: {frame_time}ms"));
 
         ui.separator();
         ui.heading("Hello World!");
@@ -344,7 +419,8 @@ fn ui_example_system(
 
         let original = loaded
             .as_ref()
-            .map(|loaded| loaded.loaded_path.path().to_path_buf());
+            .and_then(|loaded| loaded.loaded.path())
+            .map(|path| path.path().to_path_buf());
         let mut sel = original.clone();
         egui::ComboBox::new("uh", "woof")
             .selected_text(
